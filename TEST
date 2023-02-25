@@ -1,0 +1,571 @@
+@filled_blue.route('/filled', methods=['GET', 'POST'])
+@is_login
+def filled():
+    today = datetime.datetime.now().date()
+    msg_ = request.values.get('msg_', '').strip()
+    portfolio_list = db.getbyc('portfolio', condion='username is null')  # 持仓
+    platform_list = db.getbyc('platform')  # 平台费用
+    portfolio = defaultdict(dict)
+    symbol_qty = defaultdict(dict)
+    qty = 0
+    qty_ = 0
+    first = last = 0
+    leverage = 1
+    prc = 0
+    nums = 0
+    span = 0
+    span_ = 0
+    rise_effect = down_effect = 0
+    reverse_repurchase_profit = 0
+    sell_sum = buy_sum = fee_sum = rlzd_sum = 0
+    dt = str_today()
+    plt = 'all'
+    market_data = {f"{i['platform']}-{i['symbol']}": i['name'] for i in db.getbyc('market_data') or list()}
+
+    platform_charge = {}
+    for platform_data in platform_list:
+        if platform_data['fee_rate']:
+            platform_charge[platform_data['name']] = platform_data['fee_rate']
+
+    for portfolio_data in portfolio_list:
+        portfolio[portfolio_data['platform']].update({portfolio_data['symbol']: portfolio_data['qty']})
+
+        platform = portfolio_data['platform']
+        symbol = portfolio_data['symbol']
+        symbol_qty[platform][symbol] = portfolio_data['qty']
+
+    filled_status_dict = {'effect': '成交', 'all': '全部', 'valid': '有效', 'delete': '拆除'}
+    filled_status_dict.update({str(i): str(i) for i in range(-1, 5)})
+    # BUY,SELL存放买卖次数。buyPrice，sellPrice存放买卖计算公式。symbol_position存放股票或者货币代码持仓。年：存放年化收益率。capital：存放本金
+    # earning存放实际收益(binance有),earning_rate:存放收益率(在收益时间范围内)
+    action = {'BUY': 0, 'SELL': 0, 'buyPrice': 0, 'sellPrice': 0, 'symbol_position': '0', '年': '0', '年化': '0',
+              'capital': 0, 'base_earning': '0', 'quote_earning': '0', 'earning_rate': 0, 'base': '', 'quote': '',
+              '现价': 0}
+    page = int(request.values.get('page', 0)) if int(request.values.get('page', 0)) > 1 else 1
+    if request.values.get('reves') is None or request.values.get('reves') == '0':
+        reves = 1
+        reves_sort = 'asc'
+    else:
+        reves = 0
+        reves_sort = 'desc'
+
+    thread_name = [i.upper() for i in get_strategy_name().keys()]
+    strategy = request.values.get('strategy', 'all')
+    select_status = request.values.get('status', 'valid')
+    action_status = request.values.get('action', 'all')
+    sel_user = request.values.get('sel_user', 0)
+    fidorder = request.values.get('fidorder', '')
+
+    DAY_DELTA = update_days if fidorder else 1
+
+    n = datetime.datetime.now()
+    if 'end_time' in request.values:
+        end_time = request.values.get('end_time')
+    else:
+        end_time = n.strftime('%Y-%m-%d')
+
+    if 'start_time' in request.values:
+        start_time = request.values.get('start_time')
+    else:
+        temp = n - datetime.timedelta(days=DAY_DELTA)
+        start_time = temp.strftime('%Y-%m-%d')
+    currency_code = ''
+    symbol_code = ''
+    # 为注入而生
+    data = filled_sql(request.values.get('p'), request.values.get('symbol', ''), start_time, end_time,
+                      request.values.get('fidorder', ''), select_status, action_status, msg_, callFromFilled=True)
+
+    if not data:
+        return jsonify(code=0, data='没有查询参数')
+    if sel_user:
+        users = db.getbyc('account', condion=f"idaccount={sel_user}")
+        username = users[0]['username'] if users else None
+        if sel_user == '-1':
+            order_list = db.getbyc('orders', condion="creater is null or creater=''")
+        else:
+            order_list = db.getbyc('orders', condion=f"creater='{username}'") if username else []
+        orderids = [i['id'] for i in order_list]
+        if len(orderids) == 1:
+            orderids = f"({orderids[0]})"
+        else:
+            orderids = tuple(orderids)
+        data = f"fidorder in {orderids} AND {data}" if orderids else data
+    if strategy != 'all':
+        data = f"thread like '_{strategy}' AND {data}"
+        strategy = ALL_THREAD_NAME_DICT.get(strategy, strategy)
+
+    filled_data = db.getbyc('filled', data)
+    fids = [i['fidorder'] for i in filled_data] if filled_data else []
+    if len(fids) == 1:
+        fids = f"('{fids[0]}')"
+    else:
+        fids = tuple(fids)
+    origin_orders = db.getbyc('orders', condion=f"id in {fids}") if fids else []
+    origin_ids = {i['id']: i['attach_target_id'] for i in origin_orders} if origin_orders else {}
+    if filled_data:
+        [i.update({'origin_id': origin_ids.get(i['fidorder'])}) for i in filled_data if
+         origin_ids.get(i['fidorder'], None) is not None]
+    all_filled_data = filled_data
+    pages = 0
+    if not fidorder:
+        if len(filled_data) % 100 == 0:
+            pages = int(len(filled_data) / 100)  # 总页数
+        else:
+            pages = int(len(filled_data) / 100 + 1)  # 总页数
+        if page > 1:
+            filled_data = filled_data[(page - 1) * 100:page * 100]
+        else:
+            filled_data = filled_data[(page - 1) * 100:page * 100]
+
+    # 累买累卖分币种
+    sellPriceList = {}
+    buyPriceList = {}
+    sellQtyList = {}
+    buyQtyList = {}
+
+    # 买卖盈利计算的算法:buy-，sell+,fee-
+    whole = 0
+    main_money = []
+    count_list = []  # 列表买卖的数量
+    money_list = []  # 每次交易的交易费
+    new_sqldata = list(reversed(filled_data))
+    # 下面用到了whole
+    for i in new_sqldata:
+        if i['status'] >= 2 and i['status'] != 888:
+            if i['action'] == 'BUY':
+                fee = i['qty'] * i['fprice'] + i['fee']  # 失股费 + 手续费
+                whole -= fee
+                main_money.append(whole)
+                count_list.append("BUY")
+                money_list.append(fee)
+            if i['action'] == 'SELL':
+                fee = i['qty'] * i['fprice'] - i['fee']  # 赚股费 - 手续费
+                whole += fee
+                main_money.append(whole)
+                count_list.append("SELL")
+                money_list.append(fee)
+        if i['status'] < 2:
+            pass
+
+    for i in filled_data:
+        if i['status'] < 2:
+            continue
+        # 识别平台 分割 币种
+        symbol_pre, symbol_suf, is_share = symbol_split(i['platform'], i['symbol'])
+        amount_price = numpy.float32(float(i['fprice']) * float(i['qty']))
+
+        if is_share:
+            if not symbol_pre in buyQtyList:
+                buyQtyList[symbol_pre] = 0
+            if not symbol_suf in sellQtyList:
+                sellQtyList[symbol_suf] = 0
+            if not symbol_pre in buyPriceList:
+                buyPriceList[symbol_pre] = 0
+            if not symbol_suf in sellPriceList:
+                sellPriceList[symbol_suf] = 0
+            if not symbol_pre in sellQtyList:
+                sellQtyList[symbol_pre] = 0
+            if not symbol_suf in buyQtyList:
+                buyQtyList[symbol_suf] = 0
+            if not symbol_pre in sellPriceList:
+                sellPriceList[symbol_pre] = 0
+            if not symbol_suf in buyPriceList:
+                buyPriceList[symbol_suf] = 0
+
+        if str(i['action']).upper() == 'BUY':
+            action['BUY'] += 1
+
+            if is_share:
+                buyQtyList[symbol_suf] += float(i['qty'])
+                sellQtyList[symbol_pre] += float(i['qty'])
+                buyPriceList[symbol_suf] += amount_price
+                sellPriceList[symbol_pre] += amount_price
+
+        elif str(i['action']).upper() == 'SELL':
+            action['SELL'] += 1
+
+            if is_share:
+                sellQtyList[symbol_suf] += float(i['qty'])
+                buyQtyList[symbol_pre] += float(i['qty'])
+                sellPriceList[symbol_suf] += amount_price
+                buyPriceList[symbol_pre] += amount_price
+
+        try:
+            i['query_url'] = get_query_price_url(i['platform'], i['symbol'])
+        except:
+            i['query_url'] = '#'
+
+        # # 手续费
+        # charge = 0
+        # if i['platform'] in platform_charge:
+        #     charge = platform_charge[i['platform']] * amount_price
+        # i['charge'] = round(charge, 2)
+
+    grid_profit = GridProfit()
+    fmt = '%0.2f'
+    style_flag = False
+    public_sql = f"datetime BETWEEN '{start_time + ' 00:00:00'}' AND '{end_time + ' 23:59:59'}'"
+    if fidorder and fidorder != 'undefined':
+        style_flag = True
+        action['BUY'], action['SELL'] = 0, 0
+        if len(filled_data) > 0:
+            find_filled_data = portfolio[filled_data[0]['platform']]
+        else:
+            find_filled_data = filled_data
+        try:
+            if filled_data:
+                symbol = filled_data[0]['symbol']
+                platform = filled_data[0]['platform']
+                try:
+                    orders = db.getbyc('orders', f"id={fidorder}")[0]
+                    if orders:
+                        span = orders['buy_span']
+                        leverage = orders['leverage']
+                    else:
+                        span = 0
+                except Exception as ERROR:
+                    span = 0
+                if end_time == '' and start_time == '':  # 手动清除时间后，如果成交单的时间差大于15天也要更新盈利值
+                    end_time = filled_data[0]['datetime'].strftime('%Y-%m-%d')
+                    start_time = filled_data[-1]['datetime'].strftime('%Y-%m-%d')
+                action = get_profit(symbol, platform, filled_data, find_filled_data, start_time, end_time)
+            else:
+                db.update_order(f"profit = 0", fidorder)
+        except Exception as ERROR:
+            print(f"[tradelab] [filled.py] get_profit ERROR: {ERROR}")
+            span = 0
+        all_cdn = f"{public_sql} AND fidorder={fidorder} AND status>1 ORDER BY datetime ASC"  # 已成交订单
+        grid_profit = GridProfit(db.getbyc('filled', all_cdn))
+
+        try:
+            qty = grid_profit.orders[-1]['qty']
+            first = grid_profit.orders[0]['fprice']
+            last = grid_profit.orders[-1]['fprice']
+            baseline = grid_profit.orders[-1]['baseline']
+            qty_ = grid_profit.sell_qty if first < last else grid_profit.buy_qty
+            prc = (last + first) / 2
+            span_ = abs(get_span(span, baseline))
+            # if span.endswith('%'):
+            #     span_ = float(span[:-1]) / 100
+            # else:
+            #     span_ = float(span)
+            if first < last and span_:
+                nums = round((last - first) / span_)
+                rise_effect = grid_profit.orders[-1]['qty'] * span_ * (nums ** 2 / 2)
+            elif first > last and span_:
+                nums = round((first - last) / span_)
+                down_effect = grid_profit.orders[-1]['qty'] * span_ * (nums ** 2 / 2)
+
+        except:
+            pass
+
+        if filled_data:
+            symbol = filled_data[0]['symbol']
+            plt = filled_data[0]['platform']
+            symbol_code, currency_code, is_share = symbol_split(plt, symbol)
+            # prices = db.getbyc('market_data', f"symbol='{symbol}'")
+            # last = prices[0]['price'] if prices else 0
+
+        if 'USD' in currency_code or 'HK' in symbol_code:
+            if 'BTC' in symbol_code:
+                fmt = '%0.2f'
+    else:
+        action['buyPrice'] = ''
+        action['sellPrice'] = ''
+        b_i = s_i = 0
+        key_sort = sorted(buyPriceList)
+        unit_types = ['USD', 'CNY', 'HKD']
+        for key in key_sort:
+            if key in unit_types:
+                if key in buyQtyList:
+                    if buyPriceList[key] != 0:
+                        b_i += 1
+                        action['buyPrice'] += f" ({b_i}) {buyQtyList[key]:.2f} {key}  Total: {buyPriceList[key]:.2f}\n"
+                if key in sellQtyList:
+                    if sellPriceList[key] != 0:
+                        s_i += 1
+                        action[
+                            'sellPrice'] += f" ({s_i}) {-sellQtyList[key]:.2f} {key} Total: {sellPriceList[key]:.2f}\n"
+        if action['buyPrice'] == '':
+            action['buyPrice'] = ' 无'
+        if action['sellPrice'] == '':
+            action['sellPrice'] = ' 无'
+    action1 = action.copy()
+
+    for del_key in ['BUY', 'SELL', 'buyPrice', 'sellPrice', 'symbol_position', '年', '年化', 'capital', 'base_earning',
+                    'quote_earning', 'earning_rate', 'base', 'quote', '现价', 'capital_']:
+        if del_key in action:
+            del action[del_key]
+    sort = request.values.get('sort', False)
+    if sort == 'P':
+        sort = 'platform'
+    if sort in ['idfilled', 'fidorder', 'fuser', 'platform', 'symbol', 'thread', 'action', 'type', 'qty', 'baseline',
+                'fprice',
+                'charge', 'status', 'msg', 'datetime', 'orderid']:
+        filled_data = db.getbyc('filled', '%s order by %s %s' % (public_sql, sort, reves_sort))
+    # 大哥们能不能不要写类似下面这样的代码了 高危代码 我相信大家都想将程序越写越好
+    # 准则：web中不要对接收到的参数直接拿来用，而是要对接收到的参数进行校验，校验通过后再拿来用。避免一些可能出现的风险，特别是涉及数据库的操作
+    # if request.values.get('sort', False):
+    # filled_data = db.getbyc('filled', 'datetime is not null order by {} {}'.format(request.values.get('sort'), reves_sort))
+
+    action, result = handle_action_str(action)
+
+    if grid_profit.number > 0:
+        grid_number = f"{round(grid_profit.number, 6)}"
+    elif grid_profit.number < 0:
+        grid_number = f"{round(abs(grid_profit.number), 6)}"
+    else:
+        grid_number = "0"
+
+    for filled in filled_data:
+        if '-' in filled['platform']:
+            u_platform = filled['platform'].split('-')[0]
+        else:
+            u_platform = filled['platform']
+        filled['symbol_name'] = market_data.get(f"{u_platform}-{filled['symbol']}", '')
+        try:
+            filled['span'] = span
+        except:
+            filled['span'] = 0
+
+        if filled['status'] < 2:
+            continue
+        qty = filled['executed'] if filled['executed'] else filled['qty']
+
+        # 统计当前页面的累卖、累买、手续费、rlzd
+        if filled['symbol'] != 'SH.204001':
+            if filled['action'] == 'SELL':
+                sell_sum += filled['fprice'] * qty
+            elif filled['action'] == 'BUY':
+                buy_sum += filled['fprice'] * qty
+            fee_sum += filled['fee']
+            rlzd_sum += filled['rlzd']
+
+        if filled['symbol'] == 'SH.204001':
+            # 统计逆回购收益盈利
+            reverse_repurchase_profit += (filled['qty'] * 100 * filled['fprice'] / 100 / 365) - filled['qty'] * 100 * (
+                        0.001 / 100)
+
+    res_data = {'all_data': filled_data, 'filepath': tradelabConf.filepath,
+                'style_flag': style_flag, 'sel_user': sel_user,
+                'users': db.getbyc('account', condion='astatus>0') or list(),
+                'select_start_time': '' if request.values.get('start_time') == '' and request.values.get(
+                    'end_time') == '' else start_time,
+                'select_end_time': request.values.get('end_time', n.strftime('%Y-%m-%d')),
+                'query_symbol': request.values.get('symbol', ''),
+                'local_time': time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())[:10],
+                'num': 0, 'num2': 0, 'version': version, 'getSdkName': platform_names,
+                'title': session.get('email'),
+                'ip_log': request.remote_addr,
+                'filled_status_dict': filled_status_dict,
+                'select_status': select_status,
+                'fidorder': request.values.get('fidorder', ''),
+                'reves111': reves,
+                'platform': request.values.get('p', ''),
+                'd': dt, 'plt': plt,
+                'symbol': request.values.get('symbol', ''), 'price': round(0, 3),
+                's_b': round(round(0, 3) - round(0, 3), 3),
+                'action1': action1,
+                'authority': get_authority(session.get('id')),
+                'action': action,
+                'page': page,
+                'pages': pages,
+                'strategy': strategy,
+                'get_threadName': thread_name,
+                'get_platformName': platform_names,
+                'grid_price': grid_profit.profit,
+                'grid_number': grid_number,
+                'span': span,
+                'span_': span_,
+                'rise_effect': rise_effect * leverage,
+                'down_effect': down_effect * leverage,
+                'bigger_qty': grid_profit.buy_qty if grid_profit.buy_qty > grid_profit.sell_qty else grid_profit.sell_qty,
+                'smaller_qty': grid_profit.sell_qty if grid_profit.buy_qty > grid_profit.sell_qty else grid_profit.buy_qty,
+                'symbol_code': symbol_code, 'currency_code': currency_code,
+                'action_status': action_status,
+                'msg_': msg_,
+                'fmt': fmt,
+                'symbol_qty': symbol_qty,
+                'qty': qty,
+                'qty_': qty_,
+                'first': first,
+                'last': last,
+                'leverage': leverage,
+                'prc': prc,
+                'nums': nums,
+                'nums_': grid_profit.nums_,
+                'times': min(action1['BUY'], action1['SELL']),
+                'gap': grid_profit.gap * min(action1['BUY'], action1['SELL']),
+                'res': grid_profit.gap * min(action1['BUY'], action1['SELL']) * prc,
+                'grid_price_new': min(action1['BUY'], action1['SELL']) * span_ * qty_,
+                'reverse_repurchase_profit': round(reverse_repurchase_profit, 2),
+                'sell_sum': round(sell_sum, 2),
+                'buy_sum': round(buy_sum, 2),
+                'fee_sum': round(fee_sum, 2),
+                'rlzd_sum': round(rlzd_sum, 2),
+                'trade_type_list': {'-2': '快', '2': '好', '0': '现', '3': '智'}
+                }
+
+    fidorder_ = request.values.get('fidorder', '').strip()
+    if fidorder_ != '':
+        index_page_data = getIndexPageData(request.remote_addr, {'order_id_': fidorder_}, True)
+        res_data['index_page_data'] = index_page_data
+        one_ = db.get_one('orders', condition=f"where id='{fidorder_}'")
+        try:
+            if one_ is not None:
+                tmp_symbol = one_.get('symbol', '').strip()
+                if tmp_symbol != '' and tmp_symbol == 'SH.204001':
+                    fidorder = fidorder_
+                    DAY_DELTA = update_days if fidorder else 1
+                    n = datetime.datetime.now()
+                    temp_s = n - datetime.timedelta(days=DAY_DELTA)
+                    start_time_ = temp_s.strftime('%Y-%m-%d')
+                    end_time_ = n.strftime('%Y-%m-%d')
+                    data_ = filled_sql(None, '', start_time_, end_time_, fidorder, 'valid', 'all')
+                    filled_data = db.getbyc('filled', data_)
+                    if len(filled_data) > 0:
+                        res = []
+                        sum_res = 0
+                        for d in filled_data:
+                            res.append(_reverse_repo_profit(d.get('symbol'), d.get('fprice') / 100, d.get('qty') * 100))
+                        if len(res) > 0:
+                            for r in res:
+                                sum_res += r
+                            res_data['action'] = f"盈{sum_res}"
+        except:
+            logging.error(f"重新计算盈利失败 {traceback.format_exc()}")
+        currency_map = platform_currency_dict()
+        sub_attach_orders = []
+        if one_ is not None:
+            approve_orders = list(db.getbyc('orders_log', f"approve <= 0 and forder_id = {fidorder_} order by -id"))
+            tmp_attach_orders = list(db.getbyc('orders', f"attach_target_id = {fidorder_} order by -id"))
+            attach_order_logid = [i['id'] for i in tmp_attach_orders]
+            if attach_order_logid:
+                if len(attach_order_logid) == 1:
+                    attach_order_logid = "(" + str(attach_order_logid[0]) + ")"
+                else:
+                    attach_order_logid = tuple(attach_order_logid)
+                sub_attach_orders = list(db.getbyc('orders_log',
+                                                   f"approve <= 0 and forder_id in {attach_order_logid} order by -id"))
+            [i.update(trade_type=str(i['trade_type'])) for i in approve_orders]
+            if approve_orders:
+                login_user = db.get_account_info('username', session['email'])[0]
+                data = modify_wait_approve_data(approve_orders, login_user)
+                for i in data:
+                    if one_['changer_time'] and one_['changer_time'].date() == today:
+                        one_['dtupdate_today'] = one_['changer']
+                    i['origin_order'] = one_
+                res_data['approve_orders'] = data
+            if sub_attach_orders:
+                login_user = db.get_account_info('username', session['email'])[0]
+                data = modify_wait_approve_data(sub_attach_orders, login_user)
+                for i in data:
+                    if one_['changer_time'] and one_['changer_time'].date() == today:
+                        one_['dtupdate_today'] = one_['changer']
+                    # i['origin_order'] = one_
+                    i['trade_type'] = str(i['trade_type'])
+                res_data['sub_attach_orders'] = data
+            approve_attach_orders = db.getbyc('orders_log', f"approve = 0 and attach_target_id = {fidorder_} order by dtupdate")
+            if approve_attach_orders:
+                for i in approve_attach_orders:
+                    i.update({
+                        'origin_order': one_,
+                        'pk': i['id'],
+                        'last': get_last(i),
+                        'msg': str(i.get('msg', '')),
+                        'check_not_in': check_not_in(i['thread']),
+                        'query_url': get_query_price_url(i['platform'].split('-')[0], i['symbol']),
+                        'limit_down_title': order_can_buy(i, symbol_qty,
+                                                          currency_map[i['platform'].split('-')[0]]),
+                        'limit_up_title': order_can_sell(i, symbol_qty)
+                    })
+                if approve_orders:
+                    res_data['approve_orders'] += approve_attach_orders
+                else:
+                    res_data['approve_orders'] = approve_attach_orders
+
+        attach_orders = db.getbyc('orders', f"attach_target_id = {fidorder_} order by -id")
+        if attach_orders:
+            for i in attach_orders:
+                i.update({
+                    'pk': i['id'],
+                    'last': get_last(i),
+                    'msg': str(i.get('msg', '')),
+                    'trade_type': str(i['trade_type']),
+                    'check_not_in': check_not_in(i['thread']),
+                    'query_url': get_query_price_url(i['platform'].split('-')[0], i['symbol']),
+                    'limit_down_title': order_can_buy(i, symbol_qty,
+                                                      currency_map[i['platform'].split('-')[0]]),
+                    'limit_up_title': order_can_sell(i, symbol_qty)
+                })
+                if i['changer_time'] and i['changer_time'].date() == today:
+                    i['dtupdate_today'] = i['changer']
+            tmp_list = []
+            for i in attach_orders:
+                tmp_list.append(i)
+                for j in sub_attach_orders:
+                    if j['forder_id'] == i['id']:
+                        tmp_list.append(j)
+            res_data['attach_orders'] = tmp_list
+    try:
+        res_data['grid_profit_'] = float(res_data['grid_number']) * action1['现价'] + res_data['grid_price']
+        res_data['grid_profit_'] = res_data['grid_profit_'] if res_data['grid_profit_'] <= 0.01 else round(
+            res_data['grid_profit_'], 2)
+        res_data['grid_profit_new'] = (res_data['gap'] * res_data['prc'] + res_data['grid_price_new']) * leverage
+    except:
+        logging.error(f"重新合并计算策略盈利失败 {traceback.format_exc()}")
+
+    leverage_ = 1
+    if filled_data:
+        data_ = db.getbyc("market_data",
+                          f"platform = '{filled_data[0]['platform']}' and symbol = '{filled_data[0]['symbol']}'")
+        if data_:
+            leverage_ = data_[0]['leverage']
+
+    expression_1, accumulatedProfitAndLoss, profit_money, profitCalculation_num, sell_sum_, buy_sum_, fee_sum_, cost_of_carry, result = accumulatedProfitCalculation(
+        action1, all_filled_data, res_data,
+        callFromFilled=True, useLastPrice=False,
+        leverage=leverage_)
+    res_data['accumulatedProfitAndLoss'] = accumulatedProfitAndLoss
+    res_data['profit_money'] = profit_money
+
+    expression_2, accumulatedProfitAndLoss_last, profit_money_last, profitCalculation_num, sell_sum_, buy_sum_, fee_sum_, cost_of_carry, result = accumulatedProfitCalculation(
+        action1, all_filled_data, res_data,
+        callFromFilled=True,
+        useLastPrice=True,
+        leverage=leverage_)
+    res_data['accumulatedProfitAndLoss_last'] = accumulatedProfitAndLoss_last
+    res_data['money_m'] = whole
+    res_data['profitCalculation_num'] = profitCalculation_num  # 持仓数
+    # print(expression_1)  # 现价  accumulatedProfitAndLoss
+    # print(expression_2)  # 成交价  accumulatedProfitAndLoss_last
+    pp_price = 0
+    if profitCalculation_num >= 0:
+        # 持仓盈利profitable_positions = 现价 - 成交价 + 手续费
+        pp_price = expression_1 - expression_2 + fee_sum_  # 持仓盈利
+    if profitCalculation_num < 0:  # 卖出，无持仓
+        pp_price = expression_1 - expression_2 + fee_sum_  # 不是0
+    res_data['pp_price'] = pp_price  # 传给filled.html的是res_data,所以把值放进来
+    res_data['profit_money_last'] = profit_money_last
+    profit_money_last_all_ = (profit_money - profit_money_last) + sell_sum_ - buy_sum_
+    res_data['profit_money_last_all'] = f'( 累盈 仓盈（{profit_money} - {profit_money_last} ）+ 累卖{sell_sum_} - 累买{buy_sum_}) * 倍1.0 = '  #  profit_money替换成profit_money_last_all
+    res_data['profit_money_last_all_'] = round(profit_money_last_all_, 8)
+    # print('profit_money_last_all')
+    # print(res_data['profit_money_last_all'])
+    # ( 累盈 仓值(1200.0 * 现价258.4 = 310080.0) + 累卖906200.0 - 累买1040860.0 ) * 倍1.0 - fee4263.2589 = 171156.7411
+    temp_filled_data = []
+    for filled in all_filled_data:
+        if filled['status'] >= 2:
+            temp_filled_data.append(filled)
+    res_data['action1']['年化'] = cal_profit(action1, temp_filled_data, profit_money_last)
+    # 本金数小数后取2位
+    # capital_tmp = res_data['action1']['capital']
+    # if capital_tmp:
+    #     capital_tmp = round(float(re.findall(r"\d+.\d+", str(capital_tmp))[0]
+    #                               if re.findall(r"\d+.\d+", str(capital_tmp)) else 0), 2)
+    #     res_data['action1']['capital'] = res_data['action1']['capital'].replace(re.findall(r"\d+.\d+", res_data['action1']['capital'])[0], str(capital_tmp))
+    if fidorder_:
+        db.update_table('orders', f"id={fidorder_}", f"rate='{res_data['action1']['年化']}'")
+    mergeWorkingInfo(res_data)
+    return render_template('filled.html',
+                           **res_data)
